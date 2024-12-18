@@ -186,32 +186,31 @@ class Attention(nn.Module):
 
         """
         bs, seqlen, _ = x.shape
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+            # Use -1 instead of `n_heads` (or `n_kv_heads`) to infer the actual
+            # local heads from sizes of xq, xk, and xv as TP may have sharded them
+            # after the above linear ops.
+            xq = xq.view(bs, seqlen, -1, self.head_dim)
+            xk = xk.view(bs, seqlen, -1, self.head_dim)
+            xv = xv.view(bs, seqlen, -1, self.head_dim)
 
-        # Use -1 instead of `n_heads` (or `n_kv_heads`) to infer the actual
-        # local heads from sizes of xq, xk, and xv as TP may have sharded them
-        # after the above linear ops.
-        xq = xq.view(bs, seqlen, -1, self.head_dim)
-        xk = xk.view(bs, seqlen, -1, self.head_dim)
-        xv = xv.view(bs, seqlen, -1, self.head_dim)
+            xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 
-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+            # repeat k/v heads if n_kv_heads < n_heads
+            keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+            values = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
 
-        # repeat k/v heads if n_kv_heads < n_heads
-        keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-        values = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-
-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        xk = keys.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-        xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
-
-        # we use casual mask for training
-        output = F.scaled_dot_product_attention(xq, xk, xv, is_causal=True)
-        output = output.transpose(
-            1, 2
-        ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)
-        output = output.view(bs, seqlen, -1)
-        return self.wo(output)
+            xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+            xk = keys.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+            xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+            # we use casual mask for training
+            output = F.scaled_dot_product_attention(xq, xk, xv, is_causal=True)
+            output = output.transpose(
+                1, 2
+            ).contiguous()  # (bs, seqlen, n_local_heads, head_dim)
+            output = output.view(bs, seqlen, -1)
+            return self.wo(output)
 
 
 class FeedForward(nn.Module):

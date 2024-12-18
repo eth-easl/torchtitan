@@ -35,7 +35,7 @@ from torchtitan.utils import device_module, device_type
 def main(job_config: JobConfig):
     init_logger()
     logger.info(f"Starting job: {job_config.job.description}")
-
+    # set default dtype
     # used for colorful printing
     color = utils.Color if job_config.metrics.enable_color_printing else utils.NoColor
 
