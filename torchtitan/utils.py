@@ -34,14 +34,20 @@ def get_device_info():
 device_type, device_module = get_device_info()
 
 
-def dist_max(x: Union[int, float], mesh: DeviceMesh) -> float:
-    tensor = torch.tensor(x).to(device_type)
-    return funcol.all_reduce(tensor, reduceOp=c10d.ReduceOp.MAX.name, group=mesh).item()
+def dist_reduce(x: torch.Tensor, reduceOp: str, mesh: DeviceMesh) -> float:
+    if isinstance(x, DTensor):
+        # functional collectives do not support DTensor inputs
+        x = x.full_tensor()
+    assert x.numel() == 1  # required by `.item()`
+    return funcol.all_reduce(x, reduceOp=reduceOp, group=mesh).item()
 
 
-def dist_mean(x: Union[int, float], mesh: DeviceMesh) -> float:
-    tensor = torch.tensor(x).to(device_type)
-    return funcol.all_reduce(tensor, reduceOp=c10d.ReduceOp.AVG.name, group=mesh).item()
+def dist_max(x: torch.Tensor, mesh: DeviceMesh) -> float:
+    return dist_reduce(x, reduceOp=c10d.ReduceOp.MAX.name, mesh=mesh)
+
+
+def dist_mean(x: torch.Tensor, mesh: DeviceMesh) -> float:
+    return dist_reduce(x, reduceOp=c10d.ReduceOp.AVG.name, mesh=mesh)
 
 
 def _warn_overwrite_env(env, val):
@@ -384,16 +390,18 @@ def clip_grad_norm_(
         grads, norm_type, error_if_nonfinite, foreach
     )
 
+    # If total_norm is a DTensor, the placements must be `torch.distributed._tensor.ops.math_ops._NormPartial`.
+    # We can simply reduce the DTensor to get the total norm in this tensor's process group
+    # and then convert it to a local tensor.
+    # NOTE: It has two purposes:
+    #       1. to make sure the total norm is computed correctly when PP is used (see below)
+    #       2. to return a reduced total_norm tensor whose .item() would return the correct value
+    if isinstance(total_norm, DTensor):
+        # Will reach here if any non-PP parallelism is used.
+        # If only using PP, total_norm will be a local tensor.
+        total_norm = total_norm.full_tensor()
+
     if pp_mesh is not None:
-        if isinstance(total_norm, DTensor):
-            # will reach here if PP + other parallelism is used. If only using PP, total_norm will be a local tensor
-
-            # if total_norm is a DTensor, the placements must be `torch.distributed._tensor.ops.math_ops._NormPartial`
-            # we can simply reduce the DTensor to get the total norm in this tensor's process group
-            # and then convert it to a local tensor
-            total_norm = total_norm.full_tensor()
-
-        # TODO: cleanup maybe using DTensor
         if math.isinf(norm_type):
             dist.all_reduce(total_norm, op=dist.ReduceOp.MAX, group=pp_mesh.get_group())
         else:

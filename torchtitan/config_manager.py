@@ -26,7 +26,7 @@ TORCH_DTYPE_MAP = {
 
 
 def string_list(raw_arg):
-    return raw_arg.split(",")
+    return [s.strip() for s in raw_arg.split(",") if s.strip()]
 
 
 class JobConfig:
@@ -52,6 +52,7 @@ class JobConfig:
     """
 
     def __init__(self):
+        self.args_dict = None
         # main parser
         self.parser = argparse.ArgumentParser(description="torchtitan arg parser.")
 
@@ -77,9 +78,13 @@ class JobConfig:
         )
         self.parser.add_argument(
             "--job.use_for_integration_test",
-            default=False,
             action="store_true",
             help="Add this config to the integration test suite",
+        )
+        self.parser.add_argument(
+            "--job.print_args",
+            action="store_true",
+            help="Print the args to terminal",
         )
 
         # profiling configs
@@ -103,7 +108,6 @@ class JobConfig:
         self.parser.add_argument(
             "--profiling.enable_memory_snapshot",
             action="store_true",
-            default=False,
             help="Whether to dump memory snapshot",
         )
         self.parser.add_argument(
@@ -123,14 +127,12 @@ class JobConfig:
         self.parser.add_argument(
             "--metrics.enable_tensorboard",
             action="store_true",
-            default=False,
             help="Whether to log metrics to TensorBoard",
         )
         self.parser.add_argument(
-            "--metrics.enable_color_printing",
+            "--metrics.disable_color_printing",
             action="store_true",
-            default=True,
-            help="Whether to enable color printing in logs",
+            help="Whether to disable color printing in logs",
         )
         self.parser.add_argument(
             "--metrics.save_tb_folder",
@@ -138,6 +140,7 @@ class JobConfig:
             default="tb",
             help="Folder to dump TensorBoard states",
         )
+        # TODO: store_true & default=True make impossible for cmd to set it to False
         self.parser.add_argument(
             "--metrics.rank_0_only",
             action="store_true",
@@ -151,7 +154,6 @@ class JobConfig:
         self.parser.add_argument(
             "--metrics.enable_wandb",
             action="store_true",
-            default=False,
             help="Whether to log metrics to Weights & Biases",
         )
 
@@ -172,7 +174,8 @@ class JobConfig:
             "--model.norm_type",
             type=str,
             default="rmsnorm",
-            help="Type of layer normalization to use [layernorm, np_layernorm, rmsnorm, fused_rmsnorm]",
+            choices=["layernorm", "np_layernorm", "rmsnorm"],
+            help="Type of layer normalization to use [layernorm, np_layernorm, rmsnorm]",
         )
         self.parser.add_argument(
             "--model.tokenizer_path",
@@ -190,13 +193,11 @@ class JobConfig:
         )
         self.parser.add_argument(
             "--optimizer.fused",
-            default=False,
             action="store_true",
             help="Whether the fused implementation(CUDA only) is used.",
         )
         self.parser.add_argument(
             "--optimizer.early_step_in_backward",
-            default=False,
             action="store_true",
             help="""
             Whether to apply optimizer in the backward. Caution, optimizer_in_backward
@@ -269,8 +270,7 @@ class JobConfig:
         )
         self.parser.add_argument(
             "--training.enable_cpu_offload",
-            type=bool,
-            default=False,
+            action="store_true",
             help="""
             Whether to apply CPU offloading of parameters, gradients, and optimizer states in FSDP""",
         )
@@ -281,14 +281,29 @@ class JobConfig:
             help="Tensor Parallelism degree. 1 means disabled.",
         )
         self.parser.add_argument(
-            "--training.enable_loss_parallel",
-            default=True,
+            "--training.disable_loss_parallel",
             action="store_true",
             help="Whether to apply loss parallel when sequence parallel is enabled",
         )
         self.parser.add_argument(
+            "--training.fsdp_reshard_after_forward",
+            type=str,
+            default="default",
+            choices=["default", "always", "never"],
+            help="""
+            `reshard_after_forward` specifies the policy for applying `reshard_after_forward`
+            within an FSDP setup. `reshard_after_forward` controls parameter behavior after forward,
+            trading off memory and communication. See torch's `fully_shard` API for more documentation
+            on `reshard_after_forward`.
+            The supported policies include "default", "always" and "never":
+            - "default" applies default resharding behavior, implementing "smart defaults" for known optimal
+              scenarios.
+            - "always" will enable `reshard_after_forward` for all forward passes.
+            - "never" will disable `reshard_after_forward` for all forward passes.
+            """,
+        )
+        self.parser.add_argument(
             "--experimental.enable_async_tensor_parallel",
-            default=False,
             action="store_true",
             help="Whether to apply async tensor parallel (currently only effective when compile is enabled)",
         )
@@ -514,6 +529,17 @@ class JobConfig:
             default=-1,
             help="Load the checkpoint at the specified step. If -1, load the latest checkpoint.",
         )
+        self.parser.add_argument(
+            "--checkpoint.exclude_from_loading",
+            type=string_list,
+            nargs="*",
+            default=[],
+            help="""
+                Exclude specific keys from being loaded from the checkpoint.
+                Provide a comma-separated list of keys to exclude, e.g. 'optimizer,lr_scheduler,dataloader'.
+                This will load the model only, excluding the specified keys.
+            """,
+        )
         # activation checkpointing configs
         self.parser.add_argument(
             "--activation_checkpoint.mode",
@@ -544,33 +570,12 @@ class JobConfig:
         self.parser.add_argument(
             "--float8.enable_fsdp_float8_all_gather",
             action="store_true",
-            default=False,
             help="Whether enable float8 all-gather in FSDP",
         )
         self.parser.add_argument(
             "--float8.precompute_float8_dynamic_scale_for_fsdp",
             action="store_true",
-            default=False,
             help="Whether precompute float8 scales dynamically for FSDP",
-        )
-        self.parser.add_argument(
-            "--float8.scaling_type_input",
-            type=str,
-            default="dynamic",
-            help="float8 scaling for input, dynamic (default) or delayed",
-            choices=["dynamic", "delayed"],
-        )
-        self.parser.add_argument(
-            "--float8.scaling_type_weight",
-            type=str,
-            default="dynamic",
-            help="float8 scaling for input, dynamic (default) or delayed",
-        )
-        self.parser.add_argument(
-            "--float8.scaling_type_grad_output",
-            type=str,
-            default="dynamic",
-            help="float8 scaling for input, dynamic (default) or delayed",
         )
 
         # communications library settings
@@ -606,9 +611,11 @@ class JobConfig:
         self.parser.add_argument(
             "--memory_estimation.disable_fake_mode",
             help="Whether to estimate memory under FakeTensorMode",
-            default=False,
             action="store_true",
         )
+
+    def to_dict(self):
+        return self.args_dict
 
     def parse_args(self, args_list: list = sys.argv[1:]):
         args, cmd_args = self.parse_args_from_command_line(args_list)
@@ -640,12 +647,21 @@ class JobConfig:
             exp["pipeline_parallel_split_points"] = string_list(
                 exp["pipeline_parallel_split_points"]
             )
+        if (
+            "checkpoint" in args_dict
+            and "exclude_from_loading" in args_dict["checkpoint"]
+            and isinstance(args_dict["checkpoint"]["exclude_from_loading"], str)
+        ):
+            ckpt = args_dict["checkpoint"]
+            ckpt["exclude_from_loading"] = string_list(ckpt["exclude_from_loading"])
 
         # override args dict with cmd_args
         cmd_args_dict = self._args_to_two_level_dict(cmd_args)
         for section, section_args in cmd_args_dict.items():
             for k, v in section_args.items():
                 args_dict[section][k] = v
+
+        self.args_dict = args_dict
 
         for k, v in args_dict.items():
             class_type = type(k.title(), (), v)
@@ -684,6 +700,9 @@ class JobConfig:
                 # without this special case, type inference breaks here,
                 # since the inferred type is just 'list' and it ends up flattening
                 # e.g. from ["layers.0", "layers.1"] into ["l", "a", "y", "e", "r", "s", ".0", ...]
+                aux_parser.add_argument("--" + arg, type=string_list)
+            elif arg == "checkpoint.exclude_from_loading":
+                # similar to the case above
                 aux_parser.add_argument("--" + arg, type=string_list)
             else:
                 aux_parser.add_argument("--" + arg, type=type(val))

@@ -21,21 +21,14 @@ import torch.distributed.checkpoint as dcp
 import torch.nn as nn
 from torch.distributed.checkpoint.state_dict import (
     get_model_state_dict,
-    get_optimizer_state_dict,
     set_model_state_dict,
-    set_optimizer_state_dict,
     StateDictOptions,
 )
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.utils.data import DataLoader
 from torchtitan.config_manager import JobConfig, TORCH_DTYPE_MAP
 from torchtitan.logging import init_logger, logger
-from torchtitan.optimizer import (
-    OptimizersContainer,
-    OptimizersInBackwardContainer,
-    SchedulersContainer,
-    SchedulersInBackwardContainer,
-)
+from torchtitan.optimizer import OptimizersContainer, SchedulersContainer
 
 
 class IntervalType(enum.Enum):
@@ -104,43 +97,6 @@ class ModelWrapper(Stateful):
         list(map(func, self.model))
 
 
-class OptimizerWrapper(Stateful):
-    def __init__(
-        self,
-        model: Union[nn.Module, List[nn.Module]],
-        optim: OptimizersContainer,
-    ) -> None:
-        self.model = [model] if isinstance(model, nn.Module) else model
-        if isinstance(optim, OptimizersInBackwardContainer):
-            self.optim = [
-                sub_optim
-                for optim_group in optim.optimizers
-                for sub_optim in optim_group
-            ]
-        else:
-            optimizers = optim.optimizers
-            self.optim = (
-                [optimizers]
-                if isinstance(optimizers, torch.optim.Optimizer)
-                else optimizers
-            )
-
-    def state_dict(self) -> Dict[str, Any]:
-        func = functools.partial(
-            get_optimizer_state_dict,
-            options=StateDictOptions(flatten_optimizer_state_dict=True),
-        )
-        return {k: v for sd in map(func, self.model, self.optim) for k, v in sd.items()}
-
-    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        func = functools.partial(
-            set_optimizer_state_dict,
-            optim_state_dict=state_dict,
-            options=StateDictOptions(flatten_optimizer_state_dict=True),
-        )
-        list(map(func, self.model, self.optim))
-
-
 class Terminate:
     pass
 
@@ -204,7 +160,7 @@ class CheckpointManager:
         restore its optimizer states, others will error.
 
             The solution to this problem is optimizer flattening: it landed in #127071 and is enabled in TorchTitan
-            by passing the 'flatten_optimizer_state_dict' kwarg to DCP functions called in the OptimizerWrapper.
+            by passing the 'flatten_optimizer_state_dict' kwarg to DCP functions called in the OptimizerContainer.
 
         2. With complex PP schedules, we have multiple model chunks per pp rank. This compounds challenge (1) by also
         requiring us to reason about multiple 'optim' objects locally.
@@ -214,50 +170,19 @@ class CheckpointManager:
             which is gauranteed for the model by correct pipeline splitting and for the optimizer by the flattening
             support described in (1).
 
-        3. LR schedulers also index model states like optimizers and would need to be flattened properly to support
-        resharding.  Unfortunately, the implementations of different lr_schedulers do not follow a clear pattern like
-        optimizers do, so it's hard to write a generic 'flattener' utility.
-
-            TODO: This is currently unsolved and needs a fix.
+        3. LR schedulers also index model states like optimizers. Here we flatten the lr_schedulers with the assumption that
+        all lr_schedulers have the same state_dict.
         """
-        assert len(model_parts) == len(
-            optimizers.optimizers
-        ), "Must pass one optimizer per model part"
-        assert len(model_parts) == len(
-            lr_schedulers.schedulers
-        ), "Must pass one lr_scheduler per model part"
-
         self.states = states
 
         self.states.update(
             {
                 "model": ModelWrapper(model_parts),
-                "optimizer": OptimizerWrapper(
-                    model_parts,
-                    optimizers,
-                ),
+                "optimizer": optimizers,
                 "dataloader": dataloader,
+                "lr_scheduler": lr_schedulers,
             }
         )
-        # SchedulersInBackwardContainer has a different structure than SchedulersContainer, List[List[Scheduler]] rahter
-        # than List[Scheduler], but the schedulers are the same for each list inside, so here just store the first one.
-        # TODO: Restructure SchedulersInBackwardContainer to be consisitent with SchedulersContainer.
-        if isinstance(lr_schedulers, SchedulersInBackwardContainer):
-            if len(lr_schedulers.schedulers) == 1:
-                self.states["lr_scheduler"] = lr_schedulers.schedulers[0][0]
-            else:
-                # For now, pipeline-parallel with looped schedules does not support resharding for lr_scheduler.
-                # It should only support saving and loading a distributed checkpoint with the same number of pp ranks
-                for idx, lr_scheduler in enumerate(lr_schedulers.schedulers):
-                    self.states[f"lr_scheduler_{idx}"] = lr_scheduler[0]
-        else:
-            if len(lr_schedulers.schedulers) == 1:
-                self.states["lr_scheduler"] = lr_schedulers.schedulers[0]
-            else:
-                # For now, pipeline-parallel with looped schedules does not support resharding for lr_scheduler.
-                # It should only support saving and loading a distributed checkpoint with the same number of pp ranks
-                for idx, lr_scheduler in enumerate(lr_schedulers.schedulers):
-                    self.states[f"lr_scheduler_{idx}"] = lr_scheduler
 
         self.folder = os.path.join(job_config.job.dump_folder, ckpt_config.folder)
         self.interval_type = (
@@ -269,13 +194,15 @@ class CheckpointManager:
         self.begin_time = 0
         self.time_sync_work = None
         self.time_sync_result = None
-        self.pg = dist.new_group(backend="gloo")
+        async_mode = ckpt_config.async_mode.lower()
+        if async_mode == AsyncMode.ASYNC or self.interval_type == IntervalType.SECONDS:
+            self.pg = dist.new_group(backend="gloo")
 
         self.model_weights_only = ckpt_config.model_weights_only
         self.export_dtype = TORCH_DTYPE_MAP[ckpt_config.export_dtype]
+        self.exclude_from_loading = ckpt_config.exclude_from_loading
 
         self.mp = None
-        async_mode = ckpt_config.async_mode.lower()
         if async_mode == AsyncMode.DISABLED:
             self.async_mode = AsyncMode.DISABLED
         elif async_mode == AsyncMode.ASYNC:
@@ -506,10 +433,17 @@ class CheckpointManager:
         }
         logger.info(f"Loading the checkpoint at step {step}.")
         begin = time.monotonic()
+        states_to_load = {
+            k: v for k, v in states.items() if k not in self.exclude_from_loading
+        }
+        for exclude_key in self.exclude_from_loading:
+            if exclude_key not in states:
+                raise ValueError(f"{exclude_key} not found in state_dict.")
         dcp.load(
-            states,
+            states_to_load,
             checkpoint_id=self._create_checkpoint_id(step),
         )
+        states.update(states_to_load)
         logger.info(
             f"Finished loading the checkpoint in {time.monotonic() - begin:.2f} seconds."
         )
